@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restaurar dependencias
+        run: dotnet restore
+
+      - name: Compilar
+        run: dotnet build --no-restore -c Release
+
+      - name: Levantar la API y probar los endpoints
+        run: |
+          set -u
+          dotnet run --no-build -c Release --urls http://localhost:5080 > api.log 2>&1 &
+          API_PID=$!
+
+          # Esperar a que la API responda
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:5080/swagger/v1/swagger.json; then break; fi
+            sleep 1
+          done
+
+          B=http://localhost:5080/api/personas
+          FALLOS=0
+
+          check() {
+            if [ "$1" = "$2" ]; then
+              echo "OK:    $3 (HTTP $2)"
+            else
+              echo "FALLO: $3 - esperado $1, obtenido $2"
+              FALLOS=$((FALLOS+1))
+            fi
+          }
+
+          status() { curl -s -o /dev/null -w "%{http_code}" "$@"; }
+
+          JSON='Content-Type: application/json'
+
+          # 1. INSERT
+          check 201 "$(status -X POST $B -H "$JSON" -d '{"identificacion":"9001","nombres":"Test","apellidos":"CI","edad":30,"genero":"Femenino"}')" "Insertar persona femenina"
+          check 201 "$(status -X POST $B -H "$JSON" -d '{"identificacion":"9002","nombres":"Pedro","apellidos":"CI","edad":40,"genero":"Masculino"}')" "Insertar persona masculina"
+
+          # 2. INSERT duplicado y validación
+          check 409 "$(status -X POST $B -H "$JSON" -d '{"identificacion":"9001","nombres":"Dup","apellidos":"CI","edad":30,"genero":"Femenino"}')" "Insertar identificación duplicada"
+          check 400 "$(status -X POST $B -H "$JSON" -d '{"identificacion":"9003","nombres":"X","apellidos":"CI","edad":30,"genero":"Otro"}')" "Rechazar género inválido"
+
+          # 3. SELECT por identificación
+          check 200 "$(status $B/9001)" "Buscar por identificación existente"
+          check 404 "$(status $B/no-existe)" "Buscar identificación inexistente"
+          if curl -s $B/9001 | grep -q '"nombres":"Test"'; then echo "OK:    Buscar devuelve los datos correctos"; else echo "FALLO: Buscar no devuelve los datos esperados"; FALLOS=$((FALLOS+1)); fi
+
+          # 4. Listar mujeres (consulta a la vista)
+          check 200 "$(status $B/mujeres)" "Listar mujeres"
+          MUJERES=$(curl -s $B/mujeres)
+          if echo "$MUJERES" | grep -q '"identificacion":"9001"' && ! echo "$MUJERES" | grep -q '"identificacion":"9002"'; then
+            echo "OK:    La vista solo incluye mujeres"
+          else
+            echo "FALLO: La vista no filtra correctamente por género"; FALLOS=$((FALLOS+1))
+          fi
+
+          # 5. UPDATE solo edad
+          check 204 "$(status -X PATCH $B/9001/edad -H "$JSON" -d '{"edad":31}')" "Actualizar edad"
+          if curl -s $B/9001 | grep -q '"edad":31'; then echo "OK:    La edad quedó actualizada a 31"; else echo "FALLO: La edad no se actualizó"; FALLOS=$((FALLOS+1)); fi
+          check 404 "$(status -X PATCH $B/no-existe/edad -H "$JSON" -d '{"edad":31}')" "Actualizar edad de identificación inexistente"
+          check 400 "$(status -X PATCH $B/9001/edad -H "$JSON" -d '{"edad":200}')" "Rechazar edad fuera de rango"
+
+          # 6. DELETE por identificación
+          check 204 "$(status -X DELETE $B/9001)" "Eliminar persona"
+          check 404 "$(status $B/9001)" "Confirmar que la persona fue eliminada"
+          check 404 "$(status -X DELETE $B/9001)" "Eliminar identificación inexistente"
+
+          kill $API_PID 2>/dev/null || true
+
+          echo "----- Log de la API -----"
+          cat api.log
+
+          if [ "$FALLOS" -gt 0 ]; then
+            echo "Pruebas fallidas: $FALLOS"
+            exit 1
+          fi
+          echo "Todas las pruebas pasaron."
